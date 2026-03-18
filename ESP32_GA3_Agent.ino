@@ -48,7 +48,7 @@
 // ★★★ 테스트 모드 스위치 ★★★
 //==============================================================================
 #define TEST_MODE  0    // 1: UART 테스트 모드,  0: 운영 모드 (WiFi+MQTT)
-#define SELF_TEST  1    // 1: 자체 데이터 생성 (3초마다 UART 출력 + MQTT 전송)
+#define SELF_TEST  0    // 1: 자체 데이터 생성 (3초마다 UART 출력 + MQTT 전송)
                         // 0: 외부 Agent에서 UART 수신 (정상 운영)
                         // ※ TEST_MODE=0 일 때만 유효
 
@@ -57,6 +57,7 @@
 #include <Arduino.h>
 
 #if !TEST_MODE
+
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
