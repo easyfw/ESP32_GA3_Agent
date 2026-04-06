@@ -1,5 +1,23 @@
 /*******************************************************************************
- * ESP32 USB 통신 진단 + WiFi + MQTT 전송 (v4 - TEST MODE v2)
+ * ESP32 USB 통신 진단 + WiFi + MQTT 전송 (v5 - MSG_TYPE + Prod Data)
+ * 
+ * ============================================================================
+ * v5 변경사항 (v4 대비):
+ * ============================================================================
+ * - 프로토콜에 MSG_TYPE 바이트 추가
+ *   기존: [STX][LEN_L][LEN_H][CNT][items...][CHK][ETX]
+ *   신규: [STX][LEN_L][LEN_H][MSG_TYPE][CNT][items...][CHK][ETX]
+ * 
+ * - MSG_TYPE 값:
+ *   0x01 = Alarm only (OPC Alarm/Error 데이터)
+ *   0x02 = Prod only  (향후 확장용)
+ *   0x03 = Alarm + Prod 복합 (WinCutPlus 생산 행 포함)
+ * 
+ * - MQTT 토픽 분리:
+ *   factory/scm_ga3/alarm  → Alarm/Error 데이터
+ *   factory/scm_ga3/prod   → WinCutPlus 생산 데이터
+ *   factory/scm_ga3/status → 상태 정보 (기존 유지)
+ *   factory/scm_ga3/command → 명령 수신 (기존 유지)
  * 
  * ============================================================================
  * TEST_MODE 배선 구성:
@@ -19,29 +37,21 @@
  *    (패킷 수신/ACK 전송)         
  * 
  * ============================================================================
- * 테스트 절차:
- * ============================================================================
- * 1. TEST_MODE = 1 로 빌드 & 업로드
- * 2. Arduino Serial Monitor → COM9 열기 (115200) → 디버그 출력 확인
- * 3. Serial Port Utility → COM3 열기 (115200, 8N1, Hex 모드)
- * 4. Serial Port Utility에서 샘플 패킷 전송
- * 5. Serial Monitor에서 파싱 결과 확인
- * 6. Serial Port Utility에서 ACK 수신 확인 (Receive: Hex 모드로 변경)
- * 
- * ★ 샘플 패킷 (HEX):
- *   1-item:  02 08 00 01 01 00 C0 39 30 00 00 C1 03
- *   2-items: 02 0F 00 02 01 00 C0 64 00 00 00 02 00 C0 C8 00 00 00 A2 03
- * 
- * ★ Serial Port Utility Receive Setting → Hex 선택하면 ACK(02 01 00 01 03) 확인 가능
- * 
- * ============================================================================
  * 운영 모드 (TEST_MODE = 0):
  * ============================================================================
  * Serial  (USB)       → Agent 통신 (패킷 수신/ACK)
  * Serial2 (GPIO16/17) → 디버그 출력
  * WiFi + MQTT + FreeRTOS 활성화
  * 
- * 작성일: 2026-02-12
+ * ★ v5 샘플 패킷 (HEX) - MSG_TYPE 포함:
+ *   Alarm 1-item:
+ *     02 09 00 01 01 01 00 C0 39 30 00 00 C0 03
+ *     (MSG_TYPE=0x01, CNT=1, ID=1, Q=0xC0, V=12345)
+ * 
+ *   Alarm+Prod (1 alarm + 2 prod fields "AB","CD"):
+ *     02 12 00 03 01 01 00 C0 64 00 00 00 02 02 41 42 02 43 44 xx 03
+ * 
+ * 작성일: 2026-02-12 (v5 update)
  ******************************************************************************/
 
 //==============================================================================
@@ -89,7 +99,12 @@
 #define PROTO_ETX       0x03
 #define LED_PIN         2
 #define RESET_PIN       0
-#define RX_BUF_SIZE     1024
+#define RX_BUF_SIZE     2048      // v5: 1024→2048 (Prod 데이터 수용)
+
+// === MSG_TYPE 정의 ===
+#define MSG_TYPE_ALARM      0x01
+#define MSG_TYPE_PROD       0x02
+#define MSG_TYPE_ALARM_PROD 0x03
 
 #if !TEST_MODE
 #define AP_NAME         "ESP32-Wifi-Setup"
@@ -134,7 +149,7 @@ int rxDataCount = 0;
 unsigned long rxStartTime = 0;
 
 //==============================================================================
-// ★ 운영 모드 전용 변수/객체 (setup()보다 앞에 선언!)
+// ★ 운영 모드 전용 변수/객체
 //==============================================================================
 
 #if !TEST_MODE
@@ -145,9 +160,11 @@ char mqtt_client_id[32] = "ESP32_GA3_Agent";
 char mqtt_user[32] = "";
 char mqtt_pass[32] = "";
 
-const char* MQTT_TOPIC_DATA   = "factory/scm_a3/data";
-const char* MQTT_TOPIC_STATUS = "factory/scm_a3/status";
-const char* MQTT_TOPIC_CMD    = "factory/scm_a3/command";
+// === v5: MQTT 토픽 분리 ===
+const char* MQTT_TOPIC_ALARM  = "factory/scm_ga3/alarm";
+const char* MQTT_TOPIC_PROD   = "factory/scm_ga3/prod";
+const char* MQTT_TOPIC_STATUS = "factory/scm_ga3/status";
+const char* MQTT_TOPIC_CMD    = "factory/scm_ga3/command";
 
 WiFiManager wifiManager;
 Preferences preferences;
@@ -174,12 +191,24 @@ unsigned long lastMqttAttempt = 0;
 bool resetButtonPressed = false;
 unsigned long resetButtonPressTime = 0;
 
+// === v5: MQTT 큐 아이템 — Prod 데이터 포함 ===
+// Prod 데이터는 원본 CSV 행을 단일 문자열로 저장 (DRAM 절약)
+// JSON 변환은 MQTT publish 시점에 수행
+#define MAX_PROD_FIELDS    20
+#define MAX_PROD_FIELD_LEN 64
+#define MAX_PROD_RAW_LEN   256    // 원본 행 최대 길이
+
 struct MqttQueueItem {
     bool valid;
+    uint8_t msgType;                        // v5: MSG_TYPE
+    // Alarm 데이터
     uint8_t itemCount;
     uint16_t itemIds[20];
     uint8_t itemQualities[20];
     int32_t itemValues[20];
+    // Prod 데이터 — 원본 행 하나만 저장
+    bool hasProdData;
+    char prodRaw[MAX_PROD_RAW_LEN];         // 필드들을 쉼표 연결한 문자열
     unsigned long timestamp;
 };
 
@@ -228,35 +257,66 @@ const char* qualityToStr(uint8_t q)
     return "Bad";
 }
 
+// v5: MSG_TYPE를 문자열로
+const char* msgTypeToStr(uint8_t t)
+{
+    switch (t) {
+        case MSG_TYPE_ALARM:      return "ALARM";
+        case MSG_TYPE_PROD:       return "PROD";
+        case MSG_TYPE_ALARM_PROD: return "ALARM+PROD";
+        default:                  return "UNKNOWN";
+    }
+}
+
 //==============================================================================
-// ACK 응답 (COMM_SERIAL로 전송)
+// ACK/NAK 응답
 //==============================================================================
 
 void sendAckResponse()
 {
-    uint8_t response[5] = {
-        PROTO_STX,
-        0x01,       // Length Low
-        0x00,       // Length High
-        0x01,       // Data (ACK)
-        PROTO_ETX
-    };
+    uint8_t cmd = 0x01;    // RESP_CMD_ACK
+    uint8_t sts = 0x00;    // RESP_STATUS_OK
     
+    uint8_t response[5] = {
+        PROTO_STX, cmd, sts, (uint8_t)(cmd ^ sts), PROTO_ETX
+    };
     COMM_SERIAL.write(response, 5);
     COMM_SERIAL.flush();
-    
     ackSentCount++;
+    DBG_PRINTF("[ACK] Sent (#%lu): 02 %02X %02X %02X 03\n", 
+               ackSentCount, cmd, sts, (uint8_t)(cmd ^ sts));
+}
+
+void sendNakResponse(uint8_t reason)
+{
+    uint8_t cmd = 0x02;    // RESP_CMD_NAK
     
-    DBG_PRINTF("[ACK] Sent (#%lu): 02 01 00 01 03\n", ackSentCount);
+    uint8_t response[5] = {
+        PROTO_STX, cmd, reason, (uint8_t)(cmd ^ reason), PROTO_ETX
+    };
+    COMM_SERIAL.write(response, 5);
+    COMM_SERIAL.flush();
+    DBG_PRINTF("[NAK] Sent: reason=0x%02X\n", reason);
 }
 
 //==============================================================================
-// 패킷 처리
+// 패킷 처리 (v5: MSG_TYPE 기반 파싱)
+//
+// 패킷 레이아웃:
+//   [0]=STX [1]=LEN_L [2]=LEN_H [3]=MSG_TYPE [4]=CNT [5..]=items [CHK][ETX]
+//
+// MSG_TYPE_ALARM (0x01):
+//   [3]=0x01 [4]=alarm_cnt [alarm items: ID_L,ID_H,Q,V0-V3 x N] [CHK][ETX]
+//
+// MSG_TYPE_ALARM_PROD (0x03):
+//   [3]=0x03 [4]=alarm_cnt [alarm items...]
+//   [prod_field_cnt] [flen][fdata]...[flen][fdata]
+//   [CHK][ETX]
 //==============================================================================
 
 void processPacket(uint8_t* data, int len)
 {
-    if (len < 5) 
+    if (len < 6)   // v5: 최소 길이 증가 (STX+LEN2+MSGTYPE+CHK+ETX = 6)
     {
         DBG_PRINTLN("[PARSE] ERROR: Packet too short!");
         errorCount++;
@@ -276,48 +336,100 @@ void processPacket(uint8_t* data, int len)
         DBG_PRINTF("[PARSE] Checksum FAIL! recv=0x%02X calc=0x%02X\n", 
                    data[chkPos], calcChk);
         errorCount++;
+        sendNakResponse(0x01);
         return;
     }
     
     DBG_PRINTLN("[PARSE] Checksum OK!");
     
-    if (rxDataLen < 1) 
+    // === v5: MSG_TYPE 읽기 ===
+    uint8_t msgType = data[3];
+    DBG_PRINTF("[PARSE] MSG_TYPE=0x%02X (%s)\n", msgType, msgTypeToStr(msgType));
+
+    int pos = 4;  // MSG_TYPE 다음부터 데이터 시작
+
+    // ----- Alarm 파싱 (MSG_TYPE 0x01 또는 0x03) -----
+    uint8_t alarmCount = 0;
+    uint16_t parsedIds[20];
+    uint8_t parsedQualities[20];
+    int32_t parsedValues[20];
+
+    if (msgType == MSG_TYPE_ALARM || msgType == MSG_TYPE_ALARM_PROD)
     {
-        DBG_PRINTLN("[PARSE] Empty data (dataLen=0)");
-        return;
-    }
-    
-    // 데이터 파싱 + 출력
-    int itemCount = data[3];
-    DBG_PRINTF("[PARSE] Items: %d\n", itemCount);
-    
-    int pos = 4;
-    for (int i = 0; i < itemCount && pos + 6 <= chkPos; i++) 
-    {
-        uint16_t id = data[pos] | (data[pos+1] << 8);
-        uint8_t quality = data[pos+2];
-        int32_t value = (int32_t)(
-            data[pos+3] | 
-            (data[pos+4] << 8) | 
-            (data[pos+5] << 16) | 
-            (data[pos+6] << 24)
-        );
+        alarmCount = data[pos++];
+        if (alarmCount > 20) alarmCount = 20;
         
-        DBG_PRINTF("[PARSE]   #%d: ID=%u, Quality=0x%02X(%s), Value=%d (0x%08X)\n", 
-                   i, id, quality, qualityToStr(quality), value, (uint32_t)value);
+        DBG_PRINTF("[PARSE] Alarm items: %d\n", alarmCount);
         
-        pos += 7;
+        for (int i = 0; i < alarmCount && pos + 6 <= chkPos; i++) 
+        {
+            parsedIds[i] = data[pos] | (data[pos+1] << 8);
+            parsedQualities[i] = data[pos+2];
+            parsedValues[i] = (int32_t)(
+                data[pos+3] | 
+                (data[pos+4] << 8) | 
+                (data[pos+5] << 16) | 
+                (data[pos+6] << 24)
+            );
+            
+            DBG_PRINTF("[PARSE]   Alarm #%d: ID=%u, Q=0x%02X(%s), V=%ld\n", 
+                       i, parsedIds[i], parsedQualities[i], 
+                       qualityToStr(parsedQualities[i]), parsedValues[i]);
+            
+            pos += 7;
+        }
     }
-    
-    int expectedEnd = 4 + (itemCount * 7);
-    if (expectedEnd != chkPos) 
+
+    // ----- Prod 파싱 (MSG_TYPE 0x03만) -----
+    // DRAM 절약: 필드별 배열 대신 쉼표 연결 문자열로 저장
+    bool hasProdData = false;
+    char prodRaw[MAX_PROD_RAW_LEN];
+    prodRaw[0] = '\0';
+
+    if (msgType == MSG_TYPE_ALARM_PROD)
     {
-        DBG_PRINTF("[PARSE] WARNING: %d extra bytes after items\n", chkPos - expectedEnd);
+        if (pos < chkPos)
+        {
+            uint8_t prodFieldCount = data[pos++];
+            DBG_PRINTF("[PARSE] Prod fields: %d\n", prodFieldCount);
+
+            int rawPos = 0;
+            for (int f = 0; f < prodFieldCount && pos < chkPos; f++)
+            {
+                uint8_t flen = data[pos++];
+                if (flen > MAX_PROD_FIELD_LEN) flen = MAX_PROD_FIELD_LEN;
+
+                int copyLen = flen;
+                if (pos + copyLen > chkPos) copyLen = chkPos - pos;
+
+                // 쉼표 구분자 추가
+                if (f > 0 && rawPos < MAX_PROD_RAW_LEN - 1)
+                    prodRaw[rawPos++] = ',';
+
+                // 필드 복사
+                int canCopy = MAX_PROD_RAW_LEN - rawPos - 1;
+                if (copyLen > canCopy) copyLen = canCopy;
+                if (copyLen > 0)
+                {
+                    memcpy(&prodRaw[rawPos], &data[pos], copyLen);
+                    rawPos += copyLen;
+                }
+                pos += flen;
+
+                // 디버그용 임시 출력
+                prodRaw[rawPos] = '\0';
+                DBG_PRINTF("[PARSE]   Field[%d] (%d)\n", f, flen);
+            }
+            prodRaw[rawPos] = '\0';
+            hasProdData = (rawPos > 0);
+            
+            DBG_PRINTF("[PARSE] Prod raw: \"%s\"\n", prodRaw);
+        }
     }
     
     DBG_PRINTLN("----------------------------------------");
     
-    // 운영 모드: MQTT 큐에도 추가
+    // === 운영 모드: MQTT 큐에 추가 ===
     #if !TEST_MODE
     if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) 
     {
@@ -330,16 +442,28 @@ void processPacket(uint8_t* data, int len)
         }
         
         MqttQueueItem* item = &mqttQueue[mqttQueueHead];
-        item->itemCount = min(itemCount, 20);
+        item->msgType = msgType;
         item->timestamp = millis();
-        
-        int qpos = 4;
-        for (int i = 0; i < item->itemCount && qpos + 6 < chkPos; i++) 
+
+        // Alarm 데이터 저장
+        item->itemCount = min((int)alarmCount, 20);
+        for (int i = 0; i < item->itemCount; i++) 
         {
-            item->itemIds[i] = data[qpos] | (data[qpos+1] << 8);
-            item->itemQualities[i] = data[qpos+2];
-            item->itemValues[i] = (int32_t)(data[qpos+3] | (data[qpos+4] << 8) | (data[qpos+5] << 16) | (data[qpos+6] << 24));
-            qpos += 7;
+            item->itemIds[i] = parsedIds[i];
+            item->itemQualities[i] = parsedQualities[i];
+            item->itemValues[i] = parsedValues[i];
+        }
+
+        // Prod 데이터 저장 (원본 행 문자열)
+        item->hasProdData = hasProdData;
+        if (hasProdData)
+        {
+            strncpy(item->prodRaw, prodRaw, MAX_PROD_RAW_LEN - 1);
+            item->prodRaw[MAX_PROD_RAW_LEN - 1] = '\0';
+        }
+        else
+        {
+            item->prodRaw[0] = '\0';
         }
         
         item->valid = true;
@@ -505,9 +629,15 @@ void printTestStatus()
     DBG_PRINTF("RX State:   %d (%s)\n", rxState, 
                rxState == RX_WAIT_STX ? "Waiting STX" : "In progress");
     DBG_PRINTLN("=====================================");
-    DBG_PRINTLN("Send HEX via Serial Port Utility (COM3 -> GPIO16)");
-    DBG_PRINTLN("  1-item: 02 08 00 01 01 00 C0 39 30 00 00 C1 03");
-    DBG_PRINTLN("  2-item: 02 0F 00 02 01 00 C0 64 00 00 00 02 00 C0 C8 00 00 00 A2 03");
+    DBG_PRINTLN("v5 Protocol: [STX][LEN_L][LEN_H][MSG_TYPE][CNT][items...][CHK][ETX]");
+    DBG_PRINTLN();
+    DBG_PRINTLN("Sample Packets (HEX) - v5 with MSG_TYPE:");
+    DBG_PRINTLN();
+    DBG_PRINTLN("  Alarm 1-item (TYPE=0x01, ID=1, Q=Good, V=12345):");
+    DBG_PRINTLN("  02 09 00 01 01 01 00 C0 39 30 00 00 C0 03");
+    DBG_PRINTLN();
+    DBG_PRINTLN("  Alarm 2-items (TYPE=0x01):");
+    DBG_PRINTLN("  02 10 00 01 02 01 00 C0 64 00 00 00 02 00 C0 C8 00 00 00 A3 03");
     DBG_PRINTLN("=====================================\n");
 }
 #endif
@@ -537,7 +667,8 @@ void setup()
     DBG_PRINTLN("\n\n");
     DBG_PRINTLN("####################################################");
     DBG_PRINTLN("#                                                  #");
-    DBG_PRINTLN("#   ESP32 UART Reception TEST MODE (v4-test-v2)    #");
+    DBG_PRINTLN("#   ESP32 UART Reception TEST MODE (v5)            #");
+    DBG_PRINTLN("#   Protocol: MSG_TYPE support                     #");
     DBG_PRINTLN("#                                                  #");
     DBG_PRINTLN("#   WiFi/MQTT: DISABLED                            #");
     DBG_PRINTLN("#                                                  #");
@@ -551,26 +682,12 @@ void setup()
     DBG_PRINTLN("  USB-UART Adapter RX  <--  ESP32 GPIO17 (TX2)");
     DBG_PRINTLN("  USB-UART Adapter GND ---  ESP32 GND");
     DBG_PRINTLN();
-    DBG_PRINTLN("Protocol: [STX(02)] [LEN_L] [LEN_H] [DATA...] [CHK] [ETX(03)]");
-    DBG_PRINTLN("DATA:     [ItemCount(1)] [ID_L ID_H Quality Val0 Val1 Val2 Val3] x N");
-    DBG_PRINTLN("CHK:      XOR of all bytes from LEN_L to last DATA byte");
+    DBG_PRINTLN("v5 Protocol: [STX(02)] [LEN_L] [LEN_H] [MSG_TYPE] [DATA...] [CHK] [ETX(03)]");
+    DBG_PRINTLN("MSG_TYPE: 0x01=ALARM, 0x02=PROD, 0x03=ALARM+PROD");
+    DBG_PRINTLN("ALARM DATA: [ItemCount(1)] [ID_L ID_H Quality Val0-Val3] x N");
+    DBG_PRINTLN("PROD DATA:  [FieldCount(1)] [FLen(1) FData...] x N");
+    DBG_PRINTLN("CHK: XOR of all bytes from LEN_L to last DATA byte");
     DBG_PRINTLN();
-    DBG_PRINTLN("========== Sample Packets (HEX) ==========");
-    DBG_PRINTLN();
-    DBG_PRINTLN("1) 1-item (ID=1, Q=Good, Value=12345):");
-    DBG_PRINTLN("   02 08 00 01 01 00 C0 39 30 00 00 C1 03");
-    DBG_PRINTLN();
-    DBG_PRINTLN("2) 2-items (ID=1,V=100 / ID=2,V=200):");
-    DBG_PRINTLN("   02 0F 00 02 01 00 C0 64 00 00 00 02 00 C0 C8 00 00 00 A2 03");
-    DBG_PRINTLN();
-    DBG_PRINTLN("3) 3-items (ID=10,V=500 / ID=11,Q=Bad,V=0 / ID=12,V=-1):");
-    DBG_PRINTLN("   02 16 00 03 0A 00 C0 F4 01 00 00 0B 00 00 00 00 00 00 0C 00 C0 FF FF FF FF 98 03");
-    DBG_PRINTLN();
-    DBG_PRINTLN("4) Error tests:");
-    DBG_PRINTLN("   Bad ETX:      02 08 00 01 01 00 C0 39 30 00 00 C1 FF");
-    DBG_PRINTLN("   Bad Checksum: 02 08 00 01 01 00 C0 39 30 00 00 AA 03");
-    DBG_PRINTLN();
-    DBG_PRINTLN("===========================================");
     DBG_PRINTLN("Waiting for packets on Serial2 (GPIO16)...\n");
 
 #else
@@ -592,7 +709,8 @@ void setup()
     delay(500);
     
     DBG_PRINTLN("\n================================================");
-    DBG_PRINTLN("  ESP32 UART + MQTT Gateway (v4)");
+    DBG_PRINTLN("  ESP32 UART + MQTT Gateway (v5)");
+    DBG_PRINTLN("  - MSG_TYPE: Alarm/Prod separation");
     DBG_PRINTLN("  - FreeRTOS Task Separation");
     DBG_PRINTLN("  - ACK Priority Response");
     DBG_PRINTLN("================================================\n");
@@ -641,7 +759,6 @@ void setup()
     xTaskCreatePinnedToCore(mqttTask, "MQTT_Task", 8192, NULL, 1, &mqttTaskHandle, 0);
     
     #if SELF_TEST
-    // ★ 자체 테스트: UART 수신 대신 자체 데이터 생성 태스크
     xTaskCreatePinnedToCore(selfTestTask, "SelfTest_Task", 4096, NULL, 2, &uartTaskHandle, 1);
     DBG_PRINTLN("[RTOS] Tasks created! (SELF_TEST mode - no external UART input)");
     DBG_PRINTLN("[SELF_TEST] Will generate sample data every 3 seconds");
@@ -766,13 +883,13 @@ void uartTask(void* param)
 }
 
 //==============================================================================
-// Self Test 태스크 - 3초마다 샘플 데이터 생성 → UART 출력 + MQTT 전송
+// Self Test 태스크 — v5: MSG_TYPE 포함 패킷 생성
 //==============================================================================
 
 void selfTestTask(void* param)
 {
     DBG_PRINTLN("[SelfTest Task] Started on Core 1");
-    DBG_PRINTLN("[SelfTest] Generating sample packets every 3 seconds...\n");
+    DBG_PRINTLN("[SelfTest] Generating v5 sample packets every 3 seconds...\n");
     
     uint32_t seqNo = 0;
     
@@ -780,9 +897,6 @@ void selfTestTask(void* param)
     {
         seqNo++;
         
-        //----------------------------------------------------------------------
-        // 샘플 데이터 생성 (3개 아이템, 값은 매번 변경)
-        //----------------------------------------------------------------------
         const int ITEM_COUNT = 3;
         
         struct {
@@ -790,25 +904,26 @@ void selfTestTask(void* param)
             uint8_t  quality;
             int32_t  value;
         } items[ITEM_COUNT] = {
-            { 1, 0xC0, (int32_t)(1000 + (seqNo * 10) % 9000) },       // ID=1: 1000~9990 변동
-            { 2, 0xC0, (int32_t)(random(0, 500)) },                     // ID=2: 0~499 랜덤
-            { 3, (uint8_t)(seqNo % 5 == 0 ? 0x00 : 0xC0),              // ID=3: 5회마다 Bad Quality
-                 (int32_t)(analogRead(34)) }                             // ID=3: ADC 값 (GPIO34)
+            { 1, 0xC0, (int32_t)(1000 + (seqNo * 10) % 9000) },
+            { 2, 0xC0, (int32_t)(random(0, 500)) },
+            { 3, (uint8_t)(seqNo % 5 == 0 ? 0x00 : 0xC0),
+                 (int32_t)(analogRead(34)) }
         };
         
-        //----------------------------------------------------------------------
-        // 패킷 조립: [STX] [LEN_L] [LEN_H] [ItemCount] [Items...] [CHK] [ETX]
-        //----------------------------------------------------------------------
+        // === v5: MSG_TYPE 포함 패킷 조립 ===
         uint8_t pkt[128];
         int idx = 0;
         
         // STX
         pkt[idx++] = PROTO_STX;
         
-        // Data: ItemCount(1) + Items(7 * N)
-        uint16_t dataLen = 1 + (ITEM_COUNT * 7);
-        pkt[idx++] = dataLen & 0xFF;        // LEN_L
-        pkt[idx++] = (dataLen >> 8) & 0xFF;  // LEN_H
+        // Data: MSG_TYPE(1) + ItemCount(1) + Items(7 * N)
+        uint16_t dataLen = 1 + 1 + (ITEM_COUNT * 7);   // +1 for MSG_TYPE
+        pkt[idx++] = dataLen & 0xFF;
+        pkt[idx++] = (dataLen >> 8) & 0xFF;
+        
+        // MSG_TYPE
+        pkt[idx++] = MSG_TYPE_ALARM;
         
         // ItemCount
         pkt[idx++] = ITEM_COUNT;
@@ -825,7 +940,7 @@ void selfTestTask(void* param)
             pkt[idx++] = (items[i].value >> 24)  & 0xFF;
         }
         
-        // Checksum (XOR: LEN_L ~ 마지막 DATA)
+        // Checksum
         uint8_t chk = 0;
         for (int i = 1; i < idx; i++)
         {
@@ -836,30 +951,24 @@ void selfTestTask(void* param)
         // ETX
         pkt[idx++] = PROTO_ETX;
         
-        //----------------------------------------------------------------------
-        // UART(USB)로 패킷 출력
-        //----------------------------------------------------------------------
+        // UART 출력
         COMM_SERIAL.write(pkt, idx);
         COMM_SERIAL.flush();
         
-        //----------------------------------------------------------------------
-        // 디버그 출력
-        //----------------------------------------------------------------------
-        DBG_PRINTF("\n[SELF_TEST #%lu] Packet sent (%d bytes): ", seqNo, idx);
+        // 디버그
+        DBG_PRINTF("\n[SELF_TEST #%lu] v5 Packet sent (%d bytes): ", seqNo, idx);
         for (int i = 0; i < idx; i++) { DBG_PRINTF("%02X ", pkt[i]); }
         DBG_PRINTLN();
         
         for (int i = 0; i < ITEM_COUNT; i++)
         {
-            DBG_PRINTF("  Item #%d: ID=%u, Quality=0x%02X(%s), Value=%d\n",
+            DBG_PRINTF("  Item #%d: ID=%u, Quality=0x%02X(%s), Value=%ld\n",
                        i, items[i].id, items[i].quality,
                        items[i].quality >= 0xC0 ? "Good" : "Bad",
                        items[i].value);
         }
         
-        //----------------------------------------------------------------------
-        // MQTT 큐에 추가
-        //----------------------------------------------------------------------
+        // MQTT 큐
         if (xSemaphoreTake(queueMutex, pdMS_TO_TICKS(500)) == pdTRUE)
         {
             int nextHead = (mqttQueueHead + 1) % MQTT_QUEUE_SIZE;
@@ -870,7 +979,10 @@ void selfTestTask(void* param)
             }
             
             MqttQueueItem* qItem = &mqttQueue[mqttQueueHead];
+            qItem->msgType = MSG_TYPE_ALARM;
             qItem->itemCount = ITEM_COUNT;
+            qItem->hasProdData = false;
+            qItem->prodRaw[0] = '\0';
             qItem->timestamp = millis();
             
             for (int i = 0; i < ITEM_COUNT; i++)
@@ -889,7 +1001,6 @@ void selfTestTask(void* param)
             DBG_PRINTF("[SELF_TEST] Queued for MQTT (total packets: %lu)\n", packetCount);
         }
         
-        // 3초 대기
         vTaskDelay(3000 / portTICK_PERIOD_MS);
     }
 }
@@ -952,7 +1063,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
     char msg[256]; memcpy(msg, payload, min((int)length, 255)); msg[min((int)length, 255)] = '\0';
     if (strcmp(topic, MQTT_TOPIC_CMD) == 0) 
     {
-        StaticJsonDocument<256> doc;
+        JsonDocument doc;
         if (deserializeJson(doc, msg) == DeserializationError::Ok) 
         {
             const char* cmd = doc["cmd"];
@@ -967,7 +1078,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 }
 
 //==============================================================================
-// MQTT 큐 처리
+// MQTT 큐 처리 (v5: MSG_TYPE 기반 토픽 분기)
 //==============================================================================
 
 int getMqttQueueSize()
@@ -992,15 +1103,41 @@ void processMqttQueue()
         mqttQueueTail = (mqttQueueTail + 1) % MQTT_QUEUE_SIZE;
         xSemaphoreGive(queueMutex);
         
-        StaticJsonDocument<512> doc;
-        doc["device"] = mqtt_client_id; doc["timestamp"] = item.timestamp; doc["packet_id"] = packetCount;
-        for (int i = 0; i < item.itemCount; i++) 
+        // === Alarm 데이터 publish ===
+        if (item.msgType == MSG_TYPE_ALARM || item.msgType == MSG_TYPE_ALARM_PROD)
         {
-            doc["v_" + String(item.itemIds[i])] = item.itemValues[i];
-            doc["q_" + String(item.itemIds[i])] = item.itemQualities[i];
+            JsonDocument doc;
+            doc["device"] = mqtt_client_id;
+            doc["timestamp"] = item.timestamp;
+            doc["packet_id"] = packetCount;
+            
+            for (int i = 0; i < item.itemCount; i++) 
+            {
+                doc["v_" + String(item.itemIds[i])] = item.itemValues[i];
+                doc["q_" + String(item.itemIds[i])] = item.itemQualities[i];
+            }
+            
+            char buf[512];
+            serializeJson(doc, buf);
+            if (mqttClient.publish(MQTT_TOPIC_ALARM, buf)) mqttSentCount++;
+            else mqttFailCount++;
         }
-        char buf[512]; serializeJson(doc, buf);
-        if (mqttClient.publish(MQTT_TOPIC_DATA, buf)) mqttSentCount++; else mqttFailCount++;
+
+        // === Prod 데이터 publish ===
+        if (item.msgType == MSG_TYPE_ALARM_PROD && item.hasProdData)
+        {
+            // prodRaw는 "field1,field2,field3,..." 형태의 CSV 문자열
+            // Node-RED에서 쉼표 split하여 컬럼 매핑
+            JsonDocument doc;
+            doc["device"] = mqtt_client_id;
+            doc["timestamp"] = item.timestamp;
+            doc["data"] = item.prodRaw;
+            
+            char buf[512];
+            serializeJson(doc, buf);
+            if (mqttClient.publish(MQTT_TOPIC_PROD, buf)) mqttSentCount++;
+            else mqttFailCount++;
+        }
     }
 }
 
@@ -1011,7 +1148,7 @@ void processMqttQueue()
 void printStatus()
 {
     DBG_PRINTLN("\n============ STATUS ============");
-    DBG_PRINTF("Uptime: %lu sec, Heap: %d\n", millis() / 1000, ESP.getFreeHeap());
+    DBG_PRINTF("Uptime: %lu sec, Heap: %lu\n", millis() / 1000, ESP.getFreeHeap());
     DBG_PRINTF("Packets: %lu, ACK: %lu\n", packetCount, ackSentCount);
     DBG_PRINTF("WiFi: %s, MQTT: %s\n", wifiConnected ? "OK" : "NO", mqttConnected ? "OK" : "NO");
     DBG_PRINTF("MQTT Sent: %lu, Fail: %lu, Queue: %d\n", mqttSentCount, mqttFailCount, getMqttQueueSize());
@@ -1021,13 +1158,13 @@ void printStatus()
 void publishStatus()
 {
     if (!mqttConnected) return;
-    StaticJsonDocument<384> doc;
+    JsonDocument doc;
     doc["device"] = mqtt_client_id; doc["uptime"] = millis() / 1000;
     doc["packets"] = packetCount; doc["ack_sent"] = ackSentCount;
     doc["mqtt_sent"] = mqttSentCount; doc["mqtt_fail"] = mqttFailCount;
     doc["queue_size"] = getMqttQueueSize(); doc["rssi"] = WiFi.RSSI();
     doc["heap"] = ESP.getFreeHeap(); doc["ip"] = WiFi.localIP().toString();
-    doc["version"] = "v4";
+    doc["version"] = "v5";
     char buf[384]; serializeJson(doc, buf);
     mqttClient.publish(MQTT_TOPIC_STATUS, buf);
 }
