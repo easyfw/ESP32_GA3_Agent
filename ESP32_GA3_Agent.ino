@@ -106,6 +106,8 @@
 #define MSG_TYPE_PROD       0x02
 #define MSG_TYPE_ALARM_PROD 0x03
 
+#define MAX_OPC_ITEMS   30      // OPC 아이템 최대 수 (현재 21개, 여유분 포함)
+
 #if !TEST_MODE
 #define AP_NAME         "ESP32-Wifi-Setup"
 #define AP_PASSWORD     "12345678"
@@ -203,9 +205,9 @@ struct MqttQueueItem {
     uint8_t msgType;                        // v5: MSG_TYPE
     // Alarm 데이터
     uint8_t itemCount;
-    uint16_t itemIds[20];
-    uint8_t itemQualities[20];
-    int32_t itemValues[20];
+    uint16_t itemIds[MAX_OPC_ITEMS];
+    uint8_t itemQualities[MAX_OPC_ITEMS];
+    int32_t itemValues[MAX_OPC_ITEMS];
     // Prod 데이터 — 원본 행 하나만 저장
     bool hasProdData;
     char prodRaw[MAX_PROD_RAW_LEN];         // 필드들을 쉼표 연결한 문자열
@@ -350,14 +352,14 @@ void processPacket(uint8_t* data, int len)
 
     // ----- Alarm 파싱 (MSG_TYPE 0x01 또는 0x03) -----
     uint8_t alarmCount = 0;
-    uint16_t parsedIds[20];
-    uint8_t parsedQualities[20];
-    int32_t parsedValues[20];
+    uint16_t parsedIds[MAX_OPC_ITEMS];
+    uint8_t parsedQualities[MAX_OPC_ITEMS];
+    int32_t parsedValues[MAX_OPC_ITEMS];
 
     if (msgType == MSG_TYPE_ALARM || msgType == MSG_TYPE_ALARM_PROD)
     {
         alarmCount = data[pos++];
-        if (alarmCount > 20) alarmCount = 20;
+        if (alarmCount > MAX_OPC_ITEMS) alarmCount = MAX_OPC_ITEMS;
         
         DBG_PRINTF("[PARSE] Alarm items: %d\n", alarmCount);
         
@@ -446,7 +448,7 @@ void processPacket(uint8_t* data, int len)
         item->timestamp = millis();
 
         // Alarm 데이터 저장
-        item->itemCount = min((int)alarmCount, 20);
+        item->itemCount = min((int)alarmCount, (int)MAX_OPC_ITEMS);
         for (int i = 0; i < item->itemCount; i++) 
         {
             item->itemIds[i] = parsedIds[i];
@@ -1117,7 +1119,7 @@ void processMqttQueue()
                 doc["q_" + String(item.itemIds[i])] = item.itemQualities[i];
             }
             
-            char buf[512];
+            char buf[1024];
             serializeJson(doc, buf);
             if (mqttClient.publish(MQTT_TOPIC_ALARM, buf)) mqttSentCount++;
             else mqttFailCount++;
